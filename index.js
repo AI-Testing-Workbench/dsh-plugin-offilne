@@ -31,8 +31,13 @@ export function apply(ctx) {
     () => ctx.tools.register(createOfflineTool(ctx)),
     'dsh-plugin-offline: plugin_offline tool',
   );
-  ctx.effect(
-    () => registerOfflineRoutes(ctx),
-    'dsh-plugin-offline: browser export routes',
-  );
+  // The web server is optional (headless and SDK profiles have none), so wait
+  // for the service instead of reading it during apply. A child fiber also
+  // registers the routes when the service loads after this plugin.
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(
+      () => registerOfflineRoutes(webCtx),
+      'dsh-plugin-offline: browser export routes',
+    );
+  });
 }
