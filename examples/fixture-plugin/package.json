@@ -1,0 +1,24 @@
+{
+  "name": "dsh-offline-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-test bundle for dsh-plugin-offline: a Host tool that proves an offline-imported bundle loads together with its bundled npm dependency.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dependencies": {
+    "semver": "^7.6.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,4 @@
+# dsh-plugin-offline self-test fixture: one Host tool row.
+- insert:
+    - id: offline-fixture
+      name: 'dsh-offline-fixture'
