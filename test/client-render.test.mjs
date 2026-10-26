@@ -56,6 +56,22 @@ function textOf(node) {
   return render(node).join(' ');
 }
 
+/** Walk a tree and hand every host element (not function component) to `visit`. */
+function elementsOf(node, visit) {
+  if (node === null || node === undefined || typeof node === 'boolean') return;
+  if (typeof node === 'string' || typeof node === 'number') return;
+  if (Array.isArray(node)) {
+    for (const child of node) elementsOf(child, visit);
+    return;
+  }
+  if (typeof node.type === 'function') {
+    elementsOf(node.type(node.props ?? {}), visit);
+    return;
+  }
+  visit(node);
+  elementsOf(node.props?.children, visit);
+}
+
 test('browser half registers both Plugins-page seats and renders them without throwing', async () => {
   let registration;
   globalThis.window = {
@@ -157,4 +173,90 @@ test('browser half registers both Plugins-page seats and renders them without th
   assert.match(tabText, /\.dsh-offline-import-result \.dsh-offline-result\{[^}]*text-align:left/);
   assert.doesNotMatch(tabText, /color:#fff/i);
   assert.match(tabText, /font-family:inherit/);
+});
+
+test('export resolves the folder picker lazily when uiWorkspace starts after the plugin', async () => {
+  let registration;
+  globalThis.window = {
+    __ModuleLoader__: {
+      load(def) {
+        registration = def;
+      },
+    },
+  };
+  // A query keeps this import separate from the first test's cached module.
+  await import('../client.js?late-picker');
+
+  const fakeLocale = {
+    getSnapshot: () => ({ active: 'en', locales: [], revision: 0 }),
+    subscribe: () => () => {},
+    register: () => () => {},
+  };
+  /** Set only after apply, mirroring a Host that starts ui-workspace later. */
+  let picker;
+  const registered = [];
+  const ctx = {
+    locale: fakeLocale,
+    get(name) {
+      if (name === 'locale') return fakeLocale;
+      if (name === 'uiWorkspace') return picker;
+      return undefined;
+    },
+    inject(_deps, callback) {
+      callback(ctx);
+      return () => {};
+    },
+    effect(callback) {
+      const disposer = callback();
+      return () => {
+        if (typeof disposer === 'function') disposer();
+      };
+    },
+    slots: {
+      inject(key, callback) {
+        callback();
+        return () => {};
+      },
+      register(options, component) {
+        registered.push({ options, component });
+        return () => {};
+      },
+    },
+  };
+
+  const plugin = registration.factory((specifier) => {
+    if (specifier === 'react') return React;
+    throw new Error(`unexpected require(${JSON.stringify(specifier)})`);
+  });
+
+  // The service is absent while apply runs; it must not be captured as absent.
+  plugin.apply(ctx);
+  picker = { pickDirectory: async () => '/picked/folder' };
+
+  const detail = registered.find((entry) => entry.options.name === 'plugins.detail.actions');
+  let exportButton;
+  elementsOf(detail.component({ subject: { kind: 'bundle', pkg: { name: 'demo', installed: true } } }), (node) => {
+    if (node.type === 'button' && String(node.props['aria-label']).startsWith('Export offline')) exportButton = node;
+  });
+  assert.ok(exportButton, 'the detail seat renders the export button');
+
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (url, init) => {
+    request = { url, init };
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => JSON.stringify({ ok: true, result: { artifact: '/picked/folder/demo.tgz', bytes: 42 } }),
+    };
+  };
+  try {
+    await exportButton.props.onClick();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(request.url, '/dsh-offline/api/v1/export');
+  assert.deepEqual(JSON.parse(request.init.body), { plugin: 'demo', output: '/picked/folder' });
 });
