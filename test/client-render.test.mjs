@@ -76,10 +76,15 @@ test('browser half registers both Plugins-page seats and renders them without th
     register: () => () => {},
   };
   const ctx = {
+    locale: fakeLocale,
     get(name) {
       if (name === 'locale') return fakeLocale;
       if (name === 'uiWorkspace') return { pickDirectory: async () => undefined };
       return undefined;
+    },
+    inject(_deps, callback) {
+      callback(ctx);
+      return () => {};
     },
     effect(callback) {
       const disposer = callback();

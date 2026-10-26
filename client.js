@@ -131,7 +131,12 @@ window.__ModuleLoader__.load({
     function translateStatic(ctx, key, vars) {
       const locale = ctx.get('locale');
       const bound = locale !== undefined && typeof locale.bind === 'function' ? locale.bind(NS) : undefined;
-      const text = (bound === undefined ? undefined : bound(key)) ?? MESSAGES[activeLocale(ctx)][key] ?? key;
+      const boundText = bound === undefined ? undefined : bound(key);
+      // rc.3 returns the key itself for a missing namespace/entry, so only use
+      // the bound result when it actually resolved something.
+      const text = boundText !== undefined && boundText !== key
+        ? boundText
+        : MESSAGES[activeLocale(ctx)][key] ?? key;
       return format(text, vars);
     }
 
@@ -505,9 +510,9 @@ window.__ModuleLoader__.load({
      */
     function apply(ctx) {
       const ui = createUi(ctx);
-      const locale = ctx.get('locale');
-      if (locale !== undefined && typeof locale.register === 'function') {
-        ctx.effect(() => {
+      ctx.inject(['locale'], (localeCtx) => {
+        localeCtx.effect(() => {
+          const locale = localeCtx.locale;
           const disposers = [locale.register(NS, 'en', MESSAGES.en), locale.register(NS, 'zh', MESSAGES.zh)];
           return () => {
             for (const dispose of disposers) {
@@ -519,7 +524,7 @@ window.__ModuleLoader__.load({
             }
           };
         }, 'dsh-plugin-offline: dictionaries');
-      }
+      });
 
       ctx.slots.inject('plugins.detail.actions', () => ctx.slots.register({
         name: 'plugins.detail.actions',
