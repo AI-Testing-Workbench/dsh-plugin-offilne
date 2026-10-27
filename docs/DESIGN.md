@@ -112,6 +112,7 @@ checksum file is not required.
 | `test/closure.test.mjs` | teammate `closure-engine` | unit tests for it |
 | `src/profile.mjs` | lead | profile dir + installed-bundle lookup helpers |
 | `src/export.mjs` | lead | export pipeline (metadata, closure, tar) |
+| `src/verify.mjs` | lead | artifact completeness audit (export-time + `verify` action) |
 | `src/import.mjs` | lead | artifact inspection/validation + install via pluginManager |
 | `src/tool.mjs` | lead | tool schema + action dispatch |
 | `src/http.mjs` | lead | browser endpoints behind the Plugins-page buttons |
@@ -208,6 +209,33 @@ Rules:
 - Symlinks inside package content are followed (copy real content); a symlink cycle must not hang
   the copy (depth guard + warning).
 - Copy must not follow `node_modules` into the staging tree; edges are placed by the algorithm only.
+
+## Completeness audit
+
+"Every dependency is inside the artifact" is checked mechanically, not assumed:
+
+`auditPackageDir(packageDir)` walks the bundled tree from the plugin outward with Node's own
+`node_modules` lookup (`resolvePackageDir`) and reports:
+
+- **errors** (artifact not self-sufficient): a declared dependency (or bundled copy declared in
+  `bundleDependencies`) that has no files in the artifact; a missing bundle patch file; a
+  `dsh-offline.json` marker whose plugin identity disagrees with `package.json`.
+- **runtime-provided**: declared `@deepseek-ai/*` names with no bundled copy — these come from
+  the target DSH installation at load time (both peers and any skipped runtime dependency).
+- **optional missing**: optional dependencies that were not installed on the source machine
+  (other-platform binaries typically) — information only.
+- **peers not bundled**: non-runtime peers that neither resolve in the artifact nor are marked
+  optional — a warning that another bundle/runtime must supply them.
+- physical/declared `bundleDependencies` cross-checks in both directions, plus package/file/byte
+  totals.
+
+Export runs the audit on the staged tree before packing (`verification` in `dsh-offline.json`,
+`complete`/`auditErrors`/`auditWarnings` in the result). The same audit is exposed to users as
+`plugin_offline { action: "verify", artifact }`, which extracts the tarball to a temp directory
+first. `import` warns if an artifact's recorded audit reported problems. Verified on real
+artifacts: `dshmarket` → complete, 4 packages / 440 files / 7.7 MB unpacked; `dsh-univer-office`
+→ complete, 35 packages / 2,781 files / 334 MB unpacked, 9 runtime-provided peers, 16 expected
+other-platform optional absences.
 
 ## Web UI
 
@@ -315,15 +343,16 @@ Approval: `import` (profile mutation) must call the same escalation gate as `plu
 
 ## Implementation status and refinements
 
-Implemented files: `index.js`, `client.js`, `src/{tool,http,export,import,profile,closure,tar}.mjs`,
-`test/{tar,closure,pipeline,http,client-render}.test.mjs`,
-`test/integration/offline-install.test.mjs`,
+Implemented files: `index.js`, `client.js`,
+`src/{tool,http,export,import,verify,profile,closure,tar}.mjs`,
+`test/{tar,closure,pipeline,http,client-render,verify}.test.mjs`,
+`test/integration/{offline-install,peer-optional}.test.mjs`,
 `examples/fixture-plugin`.
 
 Verified:
 
-- `node --test test/*.test.mjs` → 42/42 pass (tar: 10, closure: 19, pipeline: 5, http: 7,
-  client render smoke: 1).
+- `node --test test/*.test.mjs` → 50/50 pass (tar: 10, closure: 19, pipeline: 8, http: 7,
+  client render smoke: 2, artifact verify: 4).
 - `node --test test/integration/*.test.mjs` → synthetic closure → `.tgz` →
   `pnpm add --offline --registry http://127.0.0.1:1/` in a fresh hoisted project → nested
   copies resolve and the plugin entry executes.
@@ -340,6 +369,13 @@ Verified:
   (`cliui/node_modules/string-width`, `wrap-ansi/node_modules/string-width`); offline
   install with an empty store succeeds in ~1.2 s; `inspect` streams the manifest without
   extracting the archive.
+- Intranet peer reproduction and fix: a tarball declaring `@deepseek-ai/cordis` as a peer,
+  installed by pnpm with default `autoInstallPeers` and no reachable registry, failed exactly
+  like the report (`@deepseek-ai/cordis` fetched as a direct dependency of the profile);
+  with the artifact's peer marked optional, `pnpm add --offline --store-dir <empty>` in a
+  fresh hoisted project installed only the tarball (no `node_modules/@deepseek-ai`). The
+  pnpm-free fallback is covered by the pipeline test (registry failure → materialized install,
+  manifest + bundle selection recorded; compatibility refusal → still fails).
 - A fresh `DSH_HOME` profile whose only third-party dependency is an artifact composes
   under `dsh --profile <name> --dump-config` with the plugin's row present.
 - Web UI: after the Client half was published, `Slots.listSubTree` reported the live
@@ -389,7 +425,26 @@ Refinements made during implementation:
    exact-route bridge on `ctx.webServer`, a folder picker for the export destination, a
    streamed upload entry that installs an artifact as the page user, inline results, and
    locale-driven labels. Agent-initiated imports remain approval-gated on the tool.
-9. **Install-time lifecycle scripts** (`preinstall`, `install`, `postinstall`) are removed
+9. **Peer dependencies are made optional in the artifact** (intranet fix). Reproduced the
+   reported failure locally: a tarball declaring `@deepseek-ai/cordis` as a peer, installed by
+   pnpm with the default `autoInstallPeers`, tries to fetch that peer as a direct dependency
+   of the profile (`ERR_PNPM_META_FETCH_FAIL`/`ERR_PNPM_FETCH_404`, the exact intranet symptom).
+   Adding `peerDependenciesMeta.<peer>.optional = true` to the staged manifest stops the
+   install/fetch (verified: empty store + `--offline` + bogus registry installs only the
+   tarball, no `node_modules/@deepseek-ai`). DSH's own compatibility check reads
+   `peerDependencies` and ignores the meta flag, so `@deepseek-ai/dsh-*` ranges are still
+   enforced at load. The names newly marked are recorded in `dsh-offline.json`
+   (`peersMadeOptional`) with a warning.
+10. **pnpm-free import fallback.** If the profile package manager still fails for a
+    registry/network reason (for example the profile's own dependencies cannot be resolved on
+    the isolated network), `importArtifact` materializes the artifact's bundled tree directly
+    into `<profile>/node_modules/<name>`, records `dependencies[name] = "file:<artifact>"` and
+    selects the bundle in `dsh.profile.bundles`, then reports `manual: true` with a warning
+    that the lockfile was not updated. An existing install is moved aside and restored on
+    failure, and the manifest write is atomic. Compatibility refusals and blocked build
+    scripts are never bypassed (`isRegistryInstallFailure` filters them out); the UI shows a
+    localized note when the manual path ran.
+11. **Install-time lifecycle scripts** (`preinstall`, `install`, `postinstall`) are removed
    from the staged root manifest and recorded as `scriptsRemoved` + a warning. Verified
    with pnpm 11: a tarball whose dependency declares `postinstall` installs with exit 1
    (`ERR_PNPM_IGNORED_BUILDS`) even when every file is bundled, while the same artifact

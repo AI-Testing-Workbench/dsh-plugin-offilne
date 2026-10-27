@@ -239,3 +239,116 @@ test('install-time lifecycle scripts are stripped and native builds are reported
   assert.deepEqual(inspected.metadata.scriptsRemoved, ['postinstall']);
   assert.equal(inspected.metadata.nativeBuild, true);
 });
+
+test('export marks peer dependencies optional so pnpm never fetches them on import', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-offline-pipeline-peers-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { profileDir, installAnchor } = await createProfile(root);
+  const bundleManifestPath = join(profileDir, 'node_modules', 'fixture-plugin', 'package.json');
+  const bundleManifest = JSON.parse(await readFile(bundleManifestPath, 'utf8'));
+  bundleManifest.peerDependencies = {
+    '@deepseek-ai/cordis': '^4.0.2',
+    '@deepseek-ai/dsh-tools': '^0.2.0-rc.2',
+  };
+  bundleManifest.peerDependenciesMeta = { '@deepseek-ai/dsh-tools': { optional: true, reason: 'runtime-provided' } };
+  await writeFile(bundleManifestPath, `${JSON.stringify(bundleManifest, undefined, 2)}\n`, 'utf8');
+
+  const ctx = createContext(profileDir, installAnchor, []);
+  const artifact = join(root, 'peer-artifact.tgz');
+  const exported = await exportPlugin({ ctx, plugin: 'fixture-plugin', output: artifact });
+  assert.deepEqual(exported.peersMadeOptional, ['@deepseek-ai/cordis']);
+  assert.equal(exported.warnings.some((warning) => warning.includes('peer dependencies')), true);
+
+  const inspected = await inspectArtifact(artifact, ctx);
+  assert.deepEqual(inspected.manifest.peerDependencies, {
+    '@deepseek-ai/cordis': '^4.0.2',
+    '@deepseek-ai/dsh-tools': '^0.2.0-rc.2',
+  });
+  assert.equal(inspected.manifest.peerDependenciesMeta['@deepseek-ai/cordis'].optional, true);
+  assert.equal(inspected.manifest.peerDependenciesMeta['@deepseek-ai/dsh-tools'].optional, true);
+  assert.equal(inspected.manifest.peerDependenciesMeta['@deepseek-ai/dsh-tools'].reason, 'runtime-provided');
+  assert.deepEqual(inspected.metadata.peersMadeOptional, ['@deepseek-ai/cordis']);
+});
+
+/** Minimal empty profile for the import-fallback tests. */
+async function createEmptyProfile(root, name) {
+  const profileDir = join(root, 'profiles', name);
+  await mkdir(profileDir, { recursive: true });
+  const appDir = join(root, 'app');
+  await writePackage(appDir, { name: '@deepseek-ai/dsh', version: '0.2.1-rc.2' });
+  await writeFile(join(profileDir, 'package.json'), `${JSON.stringify({
+    name: `dsh-profile-${name}`,
+    private: true,
+    dependencies: {},
+    dsh: { profile: { bundles: [] } },
+  }, undefined, 2)}\n`, 'utf8');
+  await writeFile(join(profileDir, 'cordis.yml'), '[]\n', 'utf8');
+  return { profileDir, installAnchor: join(appDir, 'package.json') };
+}
+
+/** Context for an empty profile whose manager installs fail with `error`. */
+function createFailingContext(profileDir, installAnchor, error) {
+  return {
+    get(name) {
+      if (name === 'profileContext') return { dir: profileDir, name: 'fallback-profile', installAnchor };
+      return undefined;
+    },
+    pluginManager: {
+      async listBundles() {
+        return [];
+      },
+      async installBundle() {
+        throw error;
+      },
+    },
+  };
+}
+
+test('a registry failure falls back to a pnpm-free install of the bundled artifact', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-offline-pipeline-fallback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  // Artifact from a source profile.
+  const source = await createProfile(root);
+  const sourceCtx = createContext(source.profileDir, source.installAnchor, []);
+  const artifact = join(root, 'fallback-artifact.tgz');
+  await exportPlugin({ ctx: sourceCtx, plugin: 'fixture-plugin', output: artifact });
+
+  // Target profile whose pnpm cannot reach any registry (the intranet case).
+  const target = await createEmptyProfile(root, 'target-profile');
+  const registryError = new Error(
+    'ERR_PNPM_FETCH_404 GET http://central.example.cn/artifactory/api/npm/group-npm/@deepseek-ai%2Fcordis: 404\n'
+    + 'This error happened while installing a direct dependency of the profile',
+  );
+  const targetCtx = createFailingContext(target.profileDir, target.installAnchor, registryError);
+  const imported = await importArtifact({ ctx: targetCtx, artifact });
+  assert.equal(imported.install.manual, true);
+  assert.equal(imported.install.application, 'applied');
+  assert.equal(imported.warnings.some((warning) => warning.includes('without pnpm')), true);
+
+  // The bundle files are materialized with their nested closure and recorded.
+  assert.equal((await stat(join(target.profileDir, 'node_modules', 'fixture-plugin', 'package.json'))).isFile(), true);
+  assert.equal((await stat(join(target.profileDir, 'node_modules', 'fixture-plugin', 'node_modules', 'dep-a', 'package.json'))).isFile(), true);
+  const manifest = JSON.parse(await readFile(join(target.profileDir, 'package.json'), 'utf8'));
+  assert.equal(manifest.dependencies['fixture-plugin'], `file:${artifact}`);
+  assert.deepEqual(manifest.dsh.profile.bundles, ['fixture-plugin']);
+});
+
+test('compatibility refusals are never bypassed by the pnpm-free fallback', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-offline-pipeline-incompatible-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const source = await createProfile(root);
+  const sourceCtx = createContext(source.profileDir, source.installAnchor, []);
+  const artifact = join(root, 'incompatible-artifact.tgz');
+  await exportPlugin({ ctx: sourceCtx, plugin: 'fixture-plugin', output: artifact });
+
+  const target = await createEmptyProfile(root, 'incompatible-target');
+  const incompatible = new Error('Plugin fixture-plugin@1.0.0 is incompatible with dsh 0.2.1-rc.2: peerDependencies {"@deepseek-ai/dsh-tools":"^9.0.0"}');
+  const targetCtx = createFailingContext(target.profileDir, target.installAnchor, incompatible);
+  await assert.rejects(
+    importArtifact({ ctx: targetCtx, artifact }),
+    (error) => error instanceof OfflineError && error.code === 'install-failed',
+  );
+  await assert.rejects(stat(join(target.profileDir, 'node_modules', 'fixture-plugin')), /ENOENT/);
+});
